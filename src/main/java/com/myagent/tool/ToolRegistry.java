@@ -64,6 +64,41 @@ public class ToolRegistry {
                 .toList();
     }
 
+    // ===== MCP 工具动态注册 =====
+
+    /**
+     * 注册 MCP 工具到 ToolRegistry
+     *
+     * @param qualifiedName 全限定名（mcp__server__tool）
+     * @param description   工具描述
+     * @param parameters    JSON Schema 参数定义
+     * @param mcpExecutor   MCP 工具执行器（接收参数 JSON 字符串，返回结果字符串）
+     */
+    public void registerMcpTool(String qualifiedName, String description,
+                                Object parameters, McpToolExecutor mcpExecutor) {
+        JsonNode paramsNode = null;
+        if (parameters instanceof JsonNode jn) {
+            paramsNode = jn;
+        }
+        tools.put(qualifiedName, new Tool(qualifiedName, description, paramsNode,
+                args -> {
+                    try {
+                        // 将 Map<String,String> 转成 JSON 字符串传给 MCP Client
+                        String argsJson = mapper.writeValueAsString(args);
+                        return mcpExecutor.call(argsJson);
+                    } catch (Exception e) {
+                        return "MCP 工具执行失败: " + e.getMessage();
+                    }
+                }));
+    }
+
+    /**
+     * MCP 工具执行器接口
+     */
+    public interface McpToolExecutor {
+        String call(String argumentsJson) throws Exception;
+    }
+
     // ===== 执行工具 =====
 
     public List<ToolExecutionResult> executeTools(List<ToolInvocation> invocations) {

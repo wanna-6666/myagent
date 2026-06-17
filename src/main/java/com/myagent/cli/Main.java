@@ -5,6 +5,7 @@ import com.myagent.agent.PlanExecuteAgent;
 import com.myagent.llm.DeepSeekClient;
 import com.myagent.llm.LlmClient;
 import com.myagent.llm.LlmClientFactory;
+import com.myagent.mcp.McpServerManager;
 import com.myagent.rag.CodeIndex;
 import com.myagent.tool.ToolRegistry;
 
@@ -54,6 +55,10 @@ public class Main {
         ToolRegistry toolRegistry = new ToolRegistry(System.getProperty("user.dir"));
         Agent agent = new Agent(llmClient, toolRegistry);
 
+        // MCP
+        McpServerManager mcpManager = new McpServerManager(toolRegistry);
+        Runtime.getRuntime().addShutdownHook(new Thread(mcpManager::closeAll, "mcp-shutdown"));
+
         // RAG
         String embeddingUrl = env.getProperty("EMBEDDING_API_URL", "");
         String embeddingKey = env.getProperty("EMBEDDING_API_KEY",
@@ -66,8 +71,11 @@ public class Main {
         try (Terminal terminal = TerminalBuilder.builder().system(true).dumb(true).build()) {
             LineReader reader = LineReaderBuilder.builder().terminal(terminal).build();
 
+            // 启动 MCP Servers
+            String mcpStatus = mcpManager.startAll();
+
             // 启动画面
-            printStartup(llmClient, toolRegistry);
+            printStartup(llmClient, toolRegistry, mcpManager);
 
             // 流式输出 + 思考指示器
             final boolean[] thinking = {false};
@@ -111,7 +119,7 @@ public class Main {
 
                 // 斜杠命令
                 if (input.startsWith("/")) {
-                    String result = handleCommand(input, agent, codeIndex, llmClient, env);
+                    String result = handleCommand(input, agent, codeIndex, llmClient, env, mcpManager);
                     if (result == null) break;  // /exit
                     if (result.equals("__PLAN_MODE__")) {
                         usePlanMode = true;
@@ -147,7 +155,7 @@ public class Main {
 
     // ===== 启动画面 =====
 
-    private static void printStartup(LlmClient llmClient, ToolRegistry toolRegistry) {
+    private static void printStartup(LlmClient llmClient, ToolRegistry toolRegistry, McpServerManager mcpManager) {
         System.out.println();
 
         // ASCII Banner
@@ -185,13 +193,25 @@ public class Main {
         System.out.println("  " + DIM + "├─" + RESET + " 输入你的问题，Agent 会自动调用工具完成任务");
         System.out.println("  " + DIM + "├─" + RESET + " /plan 切换到计划模式（复杂任务先拆解再执行）");
         System.out.println("  " + DIM + "├─" + RESET + " /index 索引代码库，/search 语义搜索");
+        System.out.println("  " + DIM + "├─" + RESET + " /mcp 管理 MCP Server，/model 切换模型");
         System.out.println("  " + DIM + "└─" + RESET + " /save 保存长期记忆，/exit 退出");
         System.out.println();
+
+        // MCP 状态
+        String mcpStatus = mcpManager.formatStatus();
+        if (!mcpStatus.equals("没有运行中的 MCP Server")) {
+            System.out.println("  " + BOLD + "MCP" + RESET);
+            for (String line : mcpStatus.split("\n")) {
+                System.out.println("  " + DIM + line + RESET);
+            }
+            System.out.println();
+        }
     }
 
     // ===== 斜杠命令处理 =====
 
-    private static String handleCommand(String input, Agent agent, CodeIndex codeIndex, LlmClient llmClient, Properties env) {
+    private static String handleCommand(String input, Agent agent, CodeIndex codeIndex,
+                                        LlmClient llmClient, Properties env, McpServerManager mcpManager) {
         String[] parts = input.split("\\s+", 2);
         String cmd = parts[0].toLowerCase();
         String payload = parts.length > 1 ? parts[1] : "";
@@ -263,8 +283,20 @@ public class Main {
                 if (payload.isEmpty()) yield YELLOW + "❌ 用法: /search <查询>" + RESET;
                 else yield codeIndex.hybridSearch(payload, 5);
             }
+            case "/mcp" -> {
+                if (payload.equals("start")) {
+                    yield CYAN + "🔄 启动 MCP Servers..." + RESET + "\n" + mcpManager.startAll();
+                } else if (payload.equals("stop")) {
+                    mcpManager.closeAll();
+                    yield GREEN + "🔴 所有 MCP Server 已关闭" + RESET;
+                } else {
+                    yield CYAN + "🔌 MCP Server 状态" + RESET + "\n" + mcpManager.formatStatus()
+                            + "\n\n" + DIM + "命令: /mcp start | /mcp stop" + RESET
+                            + "\n" + DIM + "配置: ~/.myagent/mcp.json 或 .myagent/mcp.json" + RESET;
+                }
+            }
             default -> RED + "❌ 未知命令: " + cmd + RESET +
-                    "\n可用: /plan /model /clear /context /save /memory /index /search /exit";
+                    "\n可用: /plan /model /mcp /clear /context /save /memory /index /search /exit";
         };
     }
 

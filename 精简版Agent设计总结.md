@@ -27,6 +27,7 @@
 | 9 | Prompt Cache | 缓存优化、成本控制 | ✅ 已设计 |
 | 10 | HITL 人机审批（设计说明） | 安全体系三层防护、审计链 | ✅ 已设计（暂不实现） |
 | 11 | Skill 插件系统（设计说明） | 三层加载、frontmatter 解析、上下文注入 | ✅ 已设计（暂不实现） |
+| 12 | MCP 协议集成 | JSON-RPC 2.0、stdio 传输、工具动态发现与注册 | ✅ 已实现 |
 
 ---
 
@@ -1007,9 +1008,11 @@ resources/
 
 > ⑤ 设计了双层上下文管理体系：对话历史接近窗口上限时自动 Map-Reduce 摘要压缩，长期记忆按 project/global 双作用域隔离并 JSON 持久化；通过 Prompt Cache 策略保持 system prompt 前缀稳定，减少重复 token 计费
 
+> ⑤ 集成 MCP（Model Context Protocol）动态工具发现与注册，基于 JSON-RPC 2.0 协议通过 stdio 传输与外部 MCP Server 通信，启动时自动握手、发现工具、按 mcp__server__tool 命名空间注册到 ToolRegistry，支持配置文件两层合并和 JVM ShutdownHook 生命周期管理
+
 **使用建议：**
 - 简历空间够 → 5 条全放
-- 只能放 4 条 → 砍 ⑤（上下文工程不如前 4 条有冲击力）
+- 只能放 4 条 → 砍 ④（SSE 流式不如 MCP 有区分度）
 - 只能放 3 条 → 留 ①②③（架构 + 并发 + RAG 是最强组合）
 
 **技术栈：** Java 17、Maven、OkHttp、JLine、JavaParser、SQLite
@@ -1393,12 +1396,158 @@ public class Agent {
 
 ---
 
+---
+
+### 12. MCP 协议集成（Model Context Protocol）
+
+**核心思想：** 实现 MCP Client，通过 JSON-RPC 2.0 协议与外部 MCP Server 通信。启动时加载配置，启动 Server 子进程，握手后自动发现并注册工具到 ToolRegistry，Agent 调用 MCP 工具时通过 `tools/call` 转发。
+
+**调用流程：**
+```
+用户输入 → Agent 选择 MCP 工具（mcp__server__tool）
+    ↓
+ToolRegistry.executeTool() 找到注册的 lambda
+    ↓
+McpClient.callTool(toolName, arguments)
+    ↓
+McpTransport.send("tools/call", params)
+    ↓
+写入 JSON-RPC 请求到 Server stdin
+    ↓
+读取 Server stdout 响应
+    ↓
+解析 result.content[].text
+    ↓
+返回结果给 Agent
+```
+
+**配置文件格式（~/.myagent/mcp.json）：**
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    }
+  }
+}
+```
+
+```java
+// ===== MCP 传输层（stdio）=====
+
+public class McpTransport implements AutoCloseable {
+    private final Process process;          // Server 子进程
+    private final BufferedWriter writer;    // → Server stdin
+    private final BufferedReader reader;    // ← Server stdout
+    private final AtomicInteger requestId;  // JSON-RPC 请求 ID 自增
+
+    // 启动 Server 子进程
+    public McpTransport(String command, String[] args, String workDir) {
+        ProcessBuilder pb = new ProcessBuilder(command, ...args);
+        pb.redirectErrorStream(false);  // stderr 不混入 JSON-RPC 流
+        process = pb.start();
+        writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream()));
+        reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+    }
+
+    // 发送 JSON-RPC 请求并等待响应
+    public JsonNode send(String method, JsonNode params) {
+        int id = requestId.getAndIncrement();
+        // 构建: {"jsonrpc":"2.0", "id":N, "method":"xxx", "params":{...}}
+        writer.write(json + "\n");
+        writer.flush();
+
+        // 读取响应，跳过通知（无 id 的消息），匹配当前 id
+        while (true) {
+            String line = reader.readLine();
+            JsonNode response = parse(line);
+            if (!response.has("id")) continue;       // 跳过通知
+            if (response.get("id").asInt() != id) continue;  // 不是我们的
+            if (response.has("error")) throw error;
+            return response.get("result");
+        }
+    }
+}
+
+// ===== MCP Client =====
+
+public class McpClient {
+    // MCP 握手：initialize → initialized 通知
+    public void initialize() {
+        transport.send("initialize", {
+            protocolVersion: "2024-11-05",
+            clientInfo: { name: "my-agent", version: "1.0.0" },
+            capabilities: { tools: {} }
+        });
+        transport.notify("notifications/initialized", {});
+    }
+
+    // 获取 Server 工具列表
+    public List<McpToolDescriptor> listTools() {
+        JsonNode result = transport.send("tools/list", {});
+        // 解析 result.tools[] → name, description, inputSchema
+        return parseTools(result);
+    }
+
+    // 调用 Server 工具
+    public String callTool(String toolName, String arguments) {
+        JsonNode result = transport.send("tools/call", {
+            name: toolName,
+            arguments: parse(arguments)
+        });
+        // 提取 result.content[].text
+        return extractText(result);
+    }
+}
+
+// ===== MCP Server 管理器 =====
+
+public class McpServerManager {
+    // 启动所有配置的 MCP Server
+    public void startAll() {
+        for (config : loadConfigs()) {
+            McpTransport transport = new McpTransport(config.command, config.args);
+            McpClient client = new McpClient(name, transport);
+            client.initialize();              // 握手
+            List<Tool> tools = client.listTools();  // 发现工具
+
+            // 动态注册到 ToolRegistry
+            for (tool : tools) {
+                toolRegistry.registerMcpTool(
+                    "mcp__" + serverName + "__" + tool.name,  // 命名空间
+                    tool.description,
+                    tool.inputSchema,
+                    args -> client.callTool(tool.name, args)  // 转发执行
+                );
+            }
+        }
+    }
+}
+```
+
+**MCP 工具命名空间：**
+```
+mcp__filesystem__read_file     ← filesystem server 的 read_file 工具
+mcp__fetch__fetch              ← fetch server 的 fetch 工具
+mcp__github__create_issue      ← github server 的 create_issue 工具
+```
+
+**面试话术：**
+> "我实现了 MCP Client，通过 JSON-RPC 2.0 协议与 MCP Server 通信。传输层用 stdio——启动 Server 子进程，通过 stdin 发请求、stdout 读响应。启动时先 initialize 握手协商协议版本和capabilities，然后 tools/list 自动发现 Server 暴露的工具，按 mcp__server__tool 命名空间注册到 ToolRegistry。Agent 调用时通过 tools/call 转发，Server 执行后返回结果。配置文件支持用户级和项目级两层合并。这样 Agent 就能动态获得新工具而不需要改代码。"
+
+---
+
 ## 六、待补充
 
 - [ ] 完善 Plan-and-Execute 的用户交互（Ctrl+O 展开、ESC 取消）
 - [ ] HITL 人机审批（设计已完成，待实现）
 - [ ] Skill 插件系统（设计已完成，待实现）
-- [ ] 更多工具（web_search、web_fetch）
+- [ ] 更多内置工具（web_search、web_fetch）
 - [ ] 渲染系统（inline 流式渲染）
 
 ---
@@ -1759,4 +1908,58 @@ public class Agent {
 
 ---
 
-> 最后更新：2026-06-16
+---
+
+### L. MCP 协议
+
+---
+
+**Q43：什么是 MCP？为什么要用它？**
+
+> MCP 是 Model Context Protocol，Anthropic 推的开放协议，解决的问题是 Agent 怎么动态连接外部工具和数据源。没有 MCP 的话，所有工具都要在代码里静态注册，新增工具需要改代码重新打包。有了 MCP，工具由独立的 Server 进程提供，Agent 启动时自动发现并注册，装新工具只需要加一个 MCP Server 配置，不需要改 Agent 代码。类似于插件系统的思想，但用标准协议统一了接口。
+
+---
+
+**Q44：MCP 的通信协议是什么？JSON-RPC 2.0 怎么工作的？**
+
+> MCP 基于 JSON-RPC 2.0 协议。每个请求格式是 `{"jsonrpc":"2.0", "id":N, "method":"xxx", "params":{...}}`，响应格式是 `{"jsonrpc":"2.0", "id":N, "result":{...}}` 或 `{"jsonrpc":"2.0", "id":N, "error":{...}}`。id 字段用于请求-响应配对，因为 stdio 是异步流，可能有通知消息（没有 id 的）穿插其中，需要通过 id 匹配正确的响应。我的实现里用 AtomicInteger 自增生成请求 id，读响应时跳过无 id 的通知消息，直到匹配到当前 id。
+
+---
+
+**Q45：MCP 的 stdio 传输层怎么管理子进程生命周期？**
+
+> 启动时用 ProcessBuilder 创建子进程，拿到 stdin/stdout 管道。stdin 用于发送 JSON-RPC 请求（BufferedWriter），stdout 用于读取响应（BufferedReader），stderr 不合并到 stdout 避免污染 JSON-RPC 流。子进程的生命周期由 McpTransport 管理，实现 AutoCloseable，关闭时先关 writer/reader 管道，再 destroyForcibly() 强制终止子进程。McpServerManager 注册了 JVM ShutdownHook，程序退出时自动关闭所有 MCP Server 子进程。
+
+---
+
+**Q46：MCP 握手的 initialize 流程是什么？**
+
+> 三步：第一步 Client 发 `initialize` 请求，带上 protocolVersion（"2024-11-05"）、clientInfo（名称和版本）、capabilities（声明支持哪些能力，比如 tools）。Server 返回自己的能力声明。第二步 Client 发 `notifications/initialized` 通知，告诉 Server 初始化完成。第三步 Client 就可以发 `tools/list` 获取工具列表了。这个握手过程确保双方协议版本兼容、能力协商完成后再进行工具发现和调用。
+
+---
+
+**Q47：MCP 工具怎么注册到 Agent 的？命名空间怎么设计的？**
+
+> Server 启动后调 `tools/list`，返回工具数组，每个工具有 name、description、inputSchema（JSON Schema）。我按 `mcp__{serverName}__{toolName}` 的命名空间格式注册到 ToolRegistry。比如 filesystem server 的 read_file 工具注册为 `mcp__filesystem__read_file`。这样不会和内置工具冲突，也能从名字看出工具来源。注册时把执行逻辑包装成 lambda：`args -> client.callTool(toolName, args)`，Agent 调用时通过 ToolRegistry 找到这个 lambda，lambda 内部通过 McpTransport 发 `tools/call` 给 Server 执行。
+
+---
+
+**Q48：MCP 工具调用失败怎么处理？**
+
+> 分三层。第一层，传输层错误（子进程崩溃、管道断开），McpTransport 抛 IOException，McpClient 捕获后返回"MCP Server 连接已断开"。第二层，JSON-RPC 错误（Server 返回 error 响应），McpTransport 解析 error.message 抛异常。第三层，工具执行错误（Server 内部错误），Server 正常返回但 result.isError=true，我把错误信息包装在返回字符串中。Agent 拿到错误信息后会作为 tool result 回灌给 LLM，LLM 可以决定重试或换方案。
+
+---
+
+**Q49：MCP 配置文件的合并策略是什么？**
+
+> 支持两层配置合并：用户级 `~/.myagent/mcp.json` 和项目级 `.myagent/mcp.json`。项目级配置覆盖用户级同名 Server，实现项目定制。加载顺序是先用户级后项目级，后者 put 覆盖前者。这和 Skill 的三层加载、Git 配置的 global/local 覆盖是同一个设计思想。
+
+---
+
+**Q50：MCP 和直接写工具有什么优劣？什么场景该用 MCP？**
+
+> 直接写工具的优势是性能好（无进程间通信）、调试简单（同一进程）、类型安全。MCP 的优势是解耦（工具和 Agent 独立部署）、生态（社区 MCP Server 可直接用）、安全性（工具在独立进程中崩溃不影响 Agent）。适合 MCP 的场景：工具需要独立的运行时环境（如 Node.js 的 filesystem server、Python 的 fetch server）、需要频繁新增工具、多 Agent 共享工具。不适合的场景：高频调用的核心工具（如 read_file），进程间通信的开销不值得。
+
+---
+
+> 最后更新：2026-06-17
