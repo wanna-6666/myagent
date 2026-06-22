@@ -17,7 +17,7 @@
 | # | 功能模块 | 面试考点 | 状态 |
 |---|---------|---------|------|
 | 1 | ReAct Agent 循环 | Agent 架构、while 循环 | ✅ 已设计 |
-| 2 | Plan-and-Execute 模式 | 策略模式、任务拆解 | ✅ 已设计 |
+| 2 | Plan-and-Execute 模式 | 策略模式、DAG 调度、拓扑排序 | ✅ 已实现 |
 | 3 | 工具系统（4 工具 + 并行执行） | 注册表模式、并发编程 | ✅ 已设计 |
 | 4 | LLM 客户端（SSE 流式） | 模板方法、流式协议解析 | ✅ 已设计 |
 | 5 | 对话历史 + 自动压缩 | 上下文工程、Map-Reduce | ✅ 已设计 |
@@ -108,72 +108,109 @@ public class Agent {
 
 ---
 
-### 2. Plan-and-Execute 模式
+### 2. Plan-and-Execute + DAG 调度
 
-**核心思想：** 复杂任务先让 LLM 拆解为多步计划，用户确认后逐步执行，每一步内部复用 ReAct Agent。
+**核心思想：** 复杂任务先让 LLM 拆解为带依赖关系的 DAG 计划，调度器按拓扑序执行，无依赖的步骤并行，每一步内部复用 ReAct Agent。
 
 ```java
+// DAG 任务节点
+public record DagTask(String id, String description, List<String> dependsOn) {}
+
 public class PlanExecuteAgent {
     private LlmClient llmClient;
     private Agent reactAgent;  // 复用已有的 ReAct Agent
 
     private static final String PLAN_PROMPT = """
-        请将以下任务拆解为 3-5 个具体步骤，每步一行，格式：
-        1. [步骤描述]
-        2. [步骤描述]
-        ...
+        请将以下任务拆解为 3-5 个具体步骤，声明依赖关系（JSON 格式）：
+        [
+          {"id": "t1", "description": "查看项目目录", "dependsOn": []},
+          {"id": "t2", "description": "搜索Java文件", "dependsOn": ["t1"]},
+          {"id": "t3", "description": "读取pom.xml", "dependsOn": []},
+          {"id": "t4", "description": "生成架构文档", "dependsOn": ["t2", "t3"]}
+        ]
         任务：%s
         """;
 
     public String run(String task) {
-        // Step 1: 让 LLM 生成计划
-        ChatResponse planResponse = llmClient.chat(
-            List.of(Message.user(String.format(PLAN_PROMPT, task))),
-            null
+        // Step 1: LLM 生成 DAG 计划
+        List<DagTask> dagTasks = parseDagTasks(
+            llmClient.chat(List.of(Message.user(String.format(PLAN_PROMPT, task))), null).content()
         );
-        List<String> steps = parseSteps(planResponse.content());
 
-        // Step 2: 展示计划，等待用户确认
-        print("📋 计划如下：");
-        for (int i = 0; i < steps.size(); i++) {
-            print("  " + (i + 1) + ". " + steps.get(i));
-        }
-        // 用户按 Enter 确认，ESC 取消，I 补充要求重新规划
-        UserDecision decision = waitForUserReview();
-        if (decision == UserDecision.CANCEL) return "已取消";
-
-        // Step 3: 逐步执行（每步复用 ReAct Agent）
-        StringBuilder allResults = new StringBuilder();
-        for (int i = 0; i < steps.size(); i++) {
-            print("▶ 执行步骤 " + (i + 1) + "/" + steps.size() + ": " + steps.get(i));
-            String stepResult = reactAgent.run(steps.get(i));
-            allResults.append("步骤 ").append(i + 1).append(": ").append(stepResult).append("\n\n");
+        // Step 2: 展示计划（含依赖关系）
+        print("📋 执行计划（DAG）：");
+        for (DagTask t : dagTasks) {
+            String deps = t.dependsOn().isEmpty() ? "无依赖（可并行）" : "依赖 " + t.dependsOn();
+            print("  " + t.id() + ". " + t.description() + "  [" + deps + "]");
         }
 
-        // Step 4: 汇总结果
-        return "✅ 计划执行完成\n\n" + allResults;
+        // Step 3: DAG 调度执行
+        return executeDag(dagTasks);
     }
 
-    private List<String> parseSteps(String content) {
-        // 解析 "1. xxx\n2. xxx" 格式
-        return Arrays.stream(content.split("\n"))
-            .filter(line -> line.matches("^\\d+\\..*"))
-            .map(line -> line.replaceFirst("^\\d+\\.\\s*", ""))
-            .toList();
+    /**
+     * DAG 调度器 - 按拓扑序执行，无依赖的步骤并行
+     */
+    private String executeDag(List<DagTask> tasks) {
+        Set<String> completed = new HashSet<>();
+        Map<String, String> results = new LinkedHashMap<>();
+
+        while (completed.size() < tasks.size()) {
+            // 找出所有依赖已完成的就绪任务
+            List<DagTask> ready = tasks.stream()
+                .filter(t -> !completed.contains(t.id()))
+                .filter(t -> completed.containsAll(t.dependsOn()))
+                .toList();
+
+            if (ready.isEmpty()) return "❌ 检测到循环依赖";
+
+            if (ready.size() == 1) {
+                // 单个就绪任务：同步执行
+                DagTask task = ready.get(0);
+                String result = reactAgent.run(task.description());
+                results.put(task.id(), result);
+                completed.add(task.id());
+            } else {
+                // 多个就绪任务：线程池并行执行
+                ExecutorService executor = Executors.newFixedThreadPool(Math.min(ready.size(), 4));
+                List<Future<Map.Entry<String, String>>> futures = new ArrayList<>();
+                for (DagTask task : ready) {
+                    futures.add(executor.submit(() ->
+                        Map.entry(task.id(), reactAgent.run(task.description()))));
+                }
+                for (int i = 0; i < futures.size(); i++) {
+                    Map.Entry<String, String> entry = futures.get(i).get(120, TimeUnit.SECONDS);
+                    results.put(entry.getKey(), entry.getValue());
+                    completed.add(entry.getKey());
+                }
+                executor.shutdownNow();
+            }
+        }
+        return formatResults(results);
+    }
+
+    // 降级：LLM 返回非 JSON 时按顺序模式解析
+    private List<DagTask> parseFallback(String content) {
+        // 解析 "1. xxx" 格式，每步依赖上一步 → 退化为顺序执行
     }
 }
 ```
 
-**Main.java 中切换：**
-```java
-switch (command) {
-    case "/plan" -> {
-        PlanExecuteAgent planAgent = new PlanExecuteAgent(llmClient, reactAgent);
-        result = planAgent.run(userInput);
-    }
-    default -> result = reactAgent.run(userInput);  // 默认 ReAct
-}
+**DAG 执行流程图：**
 ```
+LLM 生成 DAG:
+  t1: 查看目录（无依赖）
+  t2: 搜索文件（依赖 t1）
+  t3: 读 pom.xml（无依赖）
+  t4: 生成文档（依赖 t2, t3）
+
+调度执行:
+  第 1 批: t1、t3 并行执行（都无依赖）
+  第 2 批: t2 执行（依赖 t1，t1 已完成）
+  第 3 批: t4 执行（依赖 t2+t3，都已完成）
+```
+
+**降级机制：** LLM 返回非 JSON 时自动降级为顺序模式（每步依赖上一步，等价于链表）。
 
 ---
 
@@ -998,7 +1035,7 @@ resources/
 
 **技术亮点（简历用，按吸引力排序）：**
 
-> ① 设计并实现了基于 ReAct 的终端 AI 编程助手，支持 ReAct 和 Plan-and-Execute 双模式，通过 Think-Act-Observe 循环驱动大模型自主调用工具完成复杂编码任务，含停滞检测、Token 预算、轮数兜底三重循环保护机制
+> ① 设计并实现了基于 ReAct 的终端 AI 编程助手，支持 ReAct 和 Plan-and-Execute 双模式，Plan-and-Execute 支持 DAG 调度（拓扑排序 + 无依赖步骤并行），含停滞检测、Token 预算、轮数兜底三重循环保护机制
 
 > ② 实现了工具注册表 + 并行调度器，同一轮 LLM 返回多个 tool_call 时通过线程池并发执行（最多 4 路），基于 Future + invokeAll 实现批次超时控制，结果按原始顺序回灌消息历史，保证 OpenAI Function Calling 协议一致性
 
@@ -1582,9 +1619,15 @@ mcp__github__create_issue      ← github server 的 create_issue 工具
 
 ---
 
-**Q4：Plan-and-Execute 的计划是怎么生成的？用户能修改计划吗？**
+**Q4：Plan-and-Execute 的计划是怎么生成的？用了 DAG 吗？**
 
-> 计划生成就是让 LLM 做任务拆解。我设计了一个 prompt 模板，要求模型把任务拆成 3-5 个具体步骤，每步一行。生成后展示给用户，用户可以按 Enter 确认执行、ESC 取消、按 I 输入补充要求后让模型重新规划。确认后逐步执行，每一步复用已有的 ReAct Agent。执行完汇总所有步骤的结果返回给用户。
+> 计划生成是让 LLM 做任务拆解，要求模型输出 JSON 格式的步骤列表，每个步骤包含 id、description、dependsOn（依赖列表）。生成后展示给用户看依赖关系图，然后进入 DAG 调度执行。调度器每轮找出所有依赖已完成的任务（就绪任务），如果只有 1 个就同步执行，多个就用线程池并行执行。每一步内部复用 ReAct Agent。如果 LLM 返回的不是有效 JSON，自动降级为顺序模式。还有循环依赖检测——如果没有就绪任务但有未完成的步骤，说明存在循环依赖，立即报错终止。
+
+---
+
+**Q4.1：DAG 调度的具体实现？拓扑排序怎么做的？**
+
+> 我的 DAG 调度不是传统的 Kahn 算法或 DFS 拓扑排序，而是更直观的"轮询就绪"方式：每轮遍历所有未完成任务，筛选出 dependsOn 全部在 completed 集合中的任务作为就绪任务，然后并行执行。执行完加入 completed 集合，进入下一轮。这种方式的时间复杂度是 O(V²)（V 是步骤数），但步骤数只有 3-5 个，完全够用。相比传统拓扑排序代码更简单，而且天然支持并行——同一轮的所有就绪任务没有相互依赖，可以安全地并发执行。循环依赖的检测也很自然：如果某轮没有找到任何就绪任务，但还有未完成的步骤，就说明存在环。
 
 ---
 
